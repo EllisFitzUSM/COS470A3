@@ -1,6 +1,8 @@
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from bs4 import BeautifulSoup as bs
 from itertools import islice
+import nltk
+from nltk.corpus import stopwords
 import sbert_crossencoder
 import sbert_biencoder
 import argparse as ap
@@ -12,6 +14,8 @@ import re
 
 pt_biencoder_name = 'sentence-transformers/multi-qa-MiniLM-L6-cos-v1'
 pt_cross_encoder_name = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+nltk.download('stopwords')
+stopwords = stopwords.words('english')
 
 # Provide Doc Collection, QREL, then  topic files
 def __main__():
@@ -92,11 +96,12 @@ def read_collection(answer_filepath: str) -> dict[str, str]:
 
 # ! Not Removing Stop Words ATM
 def preprocess_text(text_string: str) -> str:
+    global stopwords
     res_str: str = bs(text_string, "html.parser").get_text(separator=' ')
     res_str = re.sub(r'http(s)?://\S+', ' ', res_str)
     res_str = re.sub(r'[^\x00-\x7F]+', '', res_str)
     res_str = res_str.translate({ord(p): ' ' if p in r'\/.!?-_' else None for p in string.punctuation})
-    # query['Body'].translate(str.maketrans('', '', string.punctuation))
+    res_str = ' '.join([word for word in res_str.split() if word not in stopwords])
     return res_str
 
 def generate_query_tokens(queries_dict: dict[str, list[str]]) -> dict[str, str]:

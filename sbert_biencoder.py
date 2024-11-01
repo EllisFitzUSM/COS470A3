@@ -11,10 +11,11 @@ import os
 os.environ["WANDB_DISABLED"] = "true"
 
 def get_id_text_embeddings(model, id_text: dict):
-    embeddings = {}
-    for id, text in tqdm(id_text.items(), desc='Calculating Embeddings...'):
-        embeddings[id] = model.encode(text)
-    return embeddings
+    embeddings = model.encode(list(id_text.values()), show_progress_bar=True)
+    embeddings_dict = {}
+    for index, embedding in enumerate(embeddings):
+        embeddings_dict[list(id_text.keys())[index]] = embedding
+    return embeddings_dict
 
 # Convert the Training Dict
 def convert_train_dict(train_qrel: dict, query_tokens: dict, answers: dict) -> list[InputExample]:
