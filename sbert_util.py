@@ -19,7 +19,7 @@ def load_topic_file(topic_filepath: str) -> dict[str, list[str]]:
 def read_qrel_file(qrel_filepath: str) -> dict[str, dict[str, int]]:
     qrel_dict: dict[str, dict[str, int]] = {}
     with open(qrel_filepath, "r") as f:
-        reader: csv.reader = csv.reader(f, delimiter='\t', linerterminator='\n', quotechar='"')
+        reader: csv.reader = csv.reader(f, delimiter='\t', lineterminator='\n', quotechar='"')
         for row in reader:
             query_id = row[0]
             doc_id = row[2]
@@ -28,6 +28,7 @@ def read_qrel_file(qrel_filepath: str) -> dict[str, dict[str, int]]:
                 qrel_dict[query_id][doc_id] = score
             else:
                 qrel_dict[query_id] = {doc_id : score}
+        f.close()
     return qrel_dict
 
 # Given Answer/Document File Path, Return Document Dictionary [ DocID -> Text ]
