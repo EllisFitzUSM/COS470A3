@@ -7,7 +7,7 @@ def __main__():
     parser.add_argument('results_files', nargs='+')
     args = parser.parse_args()
 
-    qrels: Qrels = Qrels.from_file('qrel_test.tsv', kind='trec')
+    qrels: Qrels = Qrels.from_file('qrels/qrel_test.tsv', kind='trec')
 
     for index, results_file in enumerate(args.results_files):
         mean_run: Run = Run.from_file(results_file, kind='trec')
