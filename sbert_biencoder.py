@@ -1,20 +1,25 @@
 # Fine-tuning Bi-encoder
 from sentence_transformers import SentenceTransformer, SentencesDataset, InputExample, losses, evaluation
 from torch.utils.data import DataLoader
-from itertools import islice
-from sbert_util import load_topic_file, read_collection, read_qrel_file
-import torch
+from collections import OrderedDict
+from datasets import Dataset
 from tqdm import tqdm
+import numpy as np
+import torch
 import math
-import random
 import os
 os.environ["WANDB_DISABLED"] = "true"
 
+pt_biencoder_name = 'sentence-transformers/multi-qa-MiniLM-L6-cos-v1'
+ft_biencoder_path = './ef_ft_bi'
+ft_biencoder_name = 'bi-ef-travel-qa-v1'
+
 def get_id_text_embeddings(model, id_text: dict):
     embeddings = model.encode(list(id_text.values()), show_progress_bar=True)
-    embeddings_dict = {}
-    for index, embedding in enumerate(embeddings):
-        embeddings_dict[list(id_text.keys())[index]] = embedding
+    keys = list(id_text.keys())
+    embeddings_dict = {
+        keys[index]: embedding for index, embedding in enumerate(embeddings)
+    }
     return embeddings_dict
 
 # Convert the Training Dict
@@ -58,80 +63,20 @@ def convert_validation_dict(validation_dict, query_tokens: dict, answers: dict) 
 
     return validation_set_topics, validation_set_answers, validation_set_scores
 
-
-# Uses the posts file, topic file(s) and qrel file(s) to build our training and evaluation sets.
-# def process_data(queries, train_dic_qrel, val_dic_qrel, collection_dic):
-#     train_samples = []
-#     evaluator_samples_1 = []
-#     evaluator_samples_2 = []
-#     evaluator_samples_score = []
-#
-#     # Build Training set
-#     for topic_id in train_dic_qrel:
-#         question = queries[topic_id]
-#         dic_answer_id = train_dic_qrel.get(topic_id, {})
-#
-#         for answer_id in dic_answer_id:
-#             score = dic_answer_id[answer_id]
-#             answer = collection_dic[answer_id]
-#             if score > 1:
-#                 train_samples.append(InputExample(texts=[question, answer], label=1.0))
-#             else:
-#                 train_samples.append(InputExample(texts=[question, answer], label=0.0))
-#
-#     for topic_id in val_dic_qrel:
-#         question = queries[topic_id]
-#         dic_answer_id = val_dic_qrel.get(topic_id, {})
-#
-#         for answer_id in dic_answer_id:
-#             score = dic_answer_id[answer_id]
-#             answer = collection_dic[answer_id]
-#             if score > 1:
-#                 label = 1.0
-#             elif score == 1:
-#                 label = 0.5
-#             else:
-#                 label = 0.0
-#             evaluator_samples_1.append(question)
-#             evaluator_samples_2.append(answer)
-#             evaluator_samples_score.append(label)
-#
-#     return train_samples, evaluator_samples_1, evaluator_samples_2, evaluator_samples_score
-
-
-
-def shuffle_dict(d):
-    keys = list(d.keys())
-    random.shuffle(keys)
-    return {key: d[key] for key in keys}
-
-def split_train_validation(qrels, ratio=0.9):
-    # Using items() + len() + list slicing
-    # Split dictionary by half
-    n = len(qrels)
-    n_split = int(n * ratio)
-    qrels = shuffle_dict(qrels)
-    train = dict(islice(qrels.items(), n_split))
-    validation = dict(islice(qrels.items(), n_split, None))
-
-    return train, validation
-
-def fine_tune(model: SentenceTransformer, train_dict, validation_dict, query_tokens: dict, answers: dict):
+def fine_tune(train_dict, validation_dict, query_tokens, answers):
+    bi_encoder = get_pretrained()
 
     num_epochs = 100 # Reducing this could speed up some processes
     batch_size = 16
 
-    my_model_name = 'ef-travel-qa-v1'
-    my_model_path = './ef_ft_bi_2024'
-
-    ft_dataset = SentencesDataSet(convert_train_dict(train_dict, query_tokens, answers))
+    ft_dataset = SentencesDataset(convert_train_dict(train_dict, query_tokens, answers), model=bi_encoder)
     ft_dataloader = DataLoader(ft_dataset, batch_size=batch_size, shuffle=True)
-    ft_loss = losses.CosineSimilarityLoss(model=model)
-    validation_topics, validation_answers, validation_scores = convert_validation_dict(validation_dict, topics, answers)
+    ft_loss = losses.CosineSimilarityLoss(model=bi_encoder)
+    validation_topics, validation_answers, validation_scores = convert_validation_dict(validation_dict, query_tokens, answers)
     evaluator = evaluation.EmbeddingSimilarityEvaluator(validation_topics, validation_answers, validation_scores, write_csv='ef_bi_epoch.csv')
     warmup_steps = math.ceil(len(ft_dataloader) * num_epochs * 0.1)
 
-    model.fit(
+    bi_encoder.fit(
         train_objectives=[(ft_dataloader, ft_loss)],
         evaluator=evaluator,
         epochs=num_epochs,
@@ -139,77 +84,39 @@ def fine_tune(model: SentenceTransformer, train_dict, validation_dict, query_tok
         use_amp=True,
         save_best_model=True,
         show_progress_bar=True,
-        output_path=my_model_path
+        output_path=ft_biencoder_path
+    )
+    bi_encoder.save(ft_biencoder_path, ft_biencoder_name)
+
+    return bi_encoder
+
+def get_pretrained():
+    bi_encoder = SentenceTransformer(pt_biencoder_name)
+    bi_encoder.to(torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'))
+    return bi_encoder
+
+def retrieve(bi_model, name: str, num: int, topics: dict, answers: dict) -> dict[str, dict[str, float]]:
+    topic_embeddings = get_id_text_embeddings(bi_model, topics)
+    answer_embeddings = get_id_text_embeddings(bi_model, answers)
+    results_dict = OrderedDict()
+
+    similarities = bi_model.similarity(
+        list(topic_embeddings.values()),
+        list(answer_embeddings.values())
     )
 
-    model.save(my_model_path, my_model_name)
+    for topic_index, topic_id in enumerate(tqdm(topics, desc='Retrieving Queries...', colour='red')):
+        scores = similarities[topic_index, : ]
+        top_100_score_idx = np.argpartition(scores, -100)[-100:]
+        top_100_scores = {list(answers.keys())[idx]: scores[idx] for idx in top_100_score_idx}
+        top_100_sorted = dict(sorted(top_100_scores.items(), key=lambda x: x[1], reverse=True))
+        results_dict[topic_id] = top_100_sorted
 
-
-
-def train(model):
-    # reading queries and collection
-    dic_topics = load_topic_file("topics_1.json")
-    queries = {}
-    for query_id in dic_topics:
-        queries[query_id] = "[TITLE]" + dic_topics[query_id][0] + "[BODY]" + dic_topics[query_id][1]
-    qrel = read_qrel_file("qrel_1.tsv")
-    collection_dic = read_collection('Answers.json')
-    train_dic_qrel, val_dic_qrel = split_train_validation(qrel)
-
-    num_epochs = 100
-    batch_size = 16
-
-    # Rename this when training the model and keep track of results
-    MODEL = "SAVED_MODEL_NAME"
-
-    # Creating train and val dataset
-    train_samples, evaluator_samples_1, evaluator_samples_2, evaluator_samples_score = process_data(queries, train_dic_qrel, val_dic_qrel, collection_dic)
-
-    convert_train_dict(train_dic_qrel, queries, collection_dic)
-    validation_topics, validation_answers, validation_scores = convert_validation_dict(val_dic_qrel, queries, collection_dic)
-
-    train_dataset = SentencesDataset(train_samples, model=model)
-    train_dataloader = DataLoader(train_dataset, shuffle = True, batch_size=batch_size)
-    train_loss = losses.CosineSimilarityLoss(model=model)
-
-    evaluator = evaluation.EmbeddingSimilarityEvaluator(evaluator_samples_1, evaluator_samples_2, evaluator_samples_score, write_csv="evaluation-epoch.csv")
-    warmup_steps = math.ceil(len(train_dataloader) * num_epochs * 0.1) #10% of train data for warm-up
-
-    # add evaluator to the model fit function
-    model.fit(
-        train_objectives =[(train_dataloader, train_loss)],
-        evaluator=evaluator,
-        epochs=num_epochs,
-        warmup_steps=warmup_steps,
-        use_amp=True,
-        save_best_model=True,
-        show_progress_bar=True,
-        output_path=MODEL
-    )
-
-
-def retrieve(model, topics: dict, answers: dict) -> dict[str, dict[str, float]]:
-    topic_embeddings = get_id_text_embeddings(model, topics)
-    answer_embeddings = get_id_text_embeddings(model, answers)
-    results_dict = {}
-
-    print('hi')
-    similarities = model.similarity(topic_embeddings, answer_embeddings)
-    print('bye')
-    for topic_index, topic_id in tqdm(enumerate(topics), desc='Retrieving Queries...', colour='red'):
-        results_dict[topic_id] = {}
-        for answer_index, answer_id in enumerate(answers):
-            similarity_score = similarities[topic_index, answer_index]
-            results_dict[topic_id][answer_id] = similarity_score
-
-        results_dict[topic_id] = sorted(results_dict[topic_id], key=lambda x: results_dict[topic_id][x], reverse=True)[:100]
+    with open(f'result_{name}_{num}.tsv', 'w', encoding='utf-8', newline='') as csvfile:
+        for qid, doc_id_scores  in results_dict.items():
+            for rank, (doc_id, score_tensor) in enumerate(doc_id_scores.items()):
+                score = score_tensor.item()
+                csvfile.write('\t'.join([qid, 'Q0', doc_id, str(rank), str(score), f'{name}_{num}']) + '\n')
+        csvfile.close()
 
     return results_dict
-
-# model = SentenceTransformer('all-MiniLM-L6-v2')
-def stuff():
-    model = SentenceTransformer('sentence-transformers/multi-qa-MiniLM-L6-cos-v1')
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(device)
-    model.to(device)
-    train(model)

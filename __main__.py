@@ -1,68 +1,86 @@
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from bs4 import BeautifulSoup as bs
-from itertools import islice
-import nltk
 from nltk.corpus import stopwords
+from itertools import islice
 import sbert_crossencoder
 import sbert_biencoder
-import argparse as ap
-import string
 from tqdm import tqdm
+import argparse as ap
+import random
+import string
 import json
+import nltk
 import csv
 import re
 
-pt_biencoder_name = 'sentence-transformers/multi-qa-MiniLM-L6-cos-v1'
-pt_cross_encoder_name = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
-nltk.download('stopwords')
-stopwords = stopwords.words('english')
+try:
+    stopwords = stopwords.words('english')
+except:
+    nltk.download('stopwords')
+    stopwords = stopwords.words('english')
 
-# Provide Doc Collection, QREL, then  topic files
 def __main__():
     parser = ap.ArgumentParser('SBert Bi-Encoder & Cross-Encoder IR')
     parser.add_argument('answers_path', type=str, help='Path to Answers File')
-    parser.add_argument('topics_1_path', type=str, help='Path to Topics 1 File for Train, Validation, and Test set.')
     parser.add_argument('qrel_path', type=str, help='Path to Qrels File Corresponding to Topics 1')
-    parser.add_argument('--extended_topics', type=str, help='Paths to multiple topics file intended for retrieval.', nargs='*')
+    parser.add_argument('topics_1_path', type=str, help='Path to Topics 1 File for Train, Validation, and Test set.')
+    parser.add_argument('extended_topics', type=str, help='Paths to multiple topics file intended for retrieval.', nargs='*')
     args = parser.parse_args()
+
+    print(len(args.extended_topics))
 
     answers = read_collection(args.answers_path)
     train_val_test_topics = load_topic_file(args.topics_1_path)
     train_qrel, validation_qrel, test_qrel = split_qrel_dict(args.qrel_path, split=0.9)
 
-    bi_encoder = SentenceTransformer(pt_biencoder_name)
-    # cross_encoder = CrossEncoder('ms-marco-MiniLM-L-6-v2')
+    train_val_test_query_tokens = generate_query_tokens(train_val_test_topics)
+    test_query_tokens = {
+        qid:query
+        for qid, query in train_val_test_query_tokens.items() if qid in test_qrel
+    }
 
-    test_query_tokens = generate_query_tokens(train_val_test_topics)
-    test_query_tokens = {qid:query for qid, query in tqdm(test_query_tokens.items(), desc='Filtering Test Queries...') if qid in test_qrel}
+    pt_bi, pt_ce, ft_bi, ft_ce = get_models(train_qrel, validation_qrel, train_val_test_query_tokens, answers)
 
-    biencoder_results = sbert_biencoder.retrieve(bi_encoder, test_query_tokens, answers)
-    retrieval_to_file(biencoder_results, model='bi', num=1)
+    bi_test_results = sbert_biencoder.retrieve(pt_bi, 'bi', 1, test_query_tokens, answers)
+    ce_test_results = sbert_crossencoder.re_rank(pt_ce, 'ce', 1, bi_test_results, test_query_tokens, answers)
+    ft_bi_test_results = sbert_biencoder.retrieve(ft_bi, 'bi_ft', 1, test_query_tokens, answers)
+    ft_ce_test_results = sbert_crossencoder.re_rank(ft_ce, 'ce_ft', 1, ft_bi_test_results, test_query_tokens, answers)
 
-    # cross_encoder_results = sbert_cross_encoder.retrieve(cross_encoder, bi_encoder, test_query_tokens, answers)
-    # retrieval_to_file(cross_encoder_results, model='cross', num=1)
+    for topic_index, topic_file in enumerate(args.extended_topics):
+        topics_dict = load_topic_file(topic_file)
+        query_tokens = generate_query_tokens(topics_dict)
 
+        bi_test_results = sbert_biencoder.retrieve(pt_bi, 'bi', topic_index+2, query_tokens, answers)
+        ce_test_results = sbert_crossencoder.re_rank(pt_ce, 'ce', topic_index+2, bi_test_results, query_tokens, answers)
+        ft_bi_test_results = sbert_biencoder.retrieve(ft_bi, 'bi_ft', topic_index+2, query_tokens, answers)
+        ft_ce_test_results = sbert_crossencoder.re_rank(ft_ce, 'ce_ft', topic_index+2, ft_bi_test_results, query_tokens, answers)
 
-    #
-    # for topic_index, topic_file in topic_file_paths:
-    #     sbert_biencoder.retrieve(topic_index, topic_file)
-    #     sbert_crossencoder.retrieve(topic_index, topic_file)
-    #
-    # pass
+def get_models(train_qrel, validation_qrel, train_val_test_query_tokens, answers) -> tuple[SentenceTransformer, CrossEncoder, SentenceTransformer, CrossEncoder]:
+    pt_bi = sbert_biencoder.get_pretrained()
+    pt_ce = sbert_crossencoder.get_pretrained()
+    ft_bi = sbert_biencoder.fine_tune(train_qrel, validation_qrel, train_val_test_query_tokens, answers)
+    ft_ce = sbert_crossencoder.fine_tune(train_qrel, validation_qrel, train_val_test_query_tokens, answers)
+    return pt_bi, pt_ce, ft_bi, ft_ce
 
 def split_qrel_dict(qrel_filepath:str, split: float = 0.9) -> tuple[dict, dict, dict]:
     qrel_dict: dict[str, dict[str, int]] = read_qrel_file(qrel_filepath)
+    query_ids = list(qrel_dict.keys())
+    random.shuffle(query_ids)
+    qrel_dict = {query_id:qrel_dict[query_id] for query_id in query_ids}
+
     query_count: int = len(qrel_dict)
     train_set_count: int = int(query_count * split)
     val_set_count: int = int((query_count - train_set_count) / 2)
-    train_qrel: dict[str, list] = dict(islice(qrel_dict.items(), train_set_count))
-    validation_qrel: dict[str, list] = dict(islice(qrel_dict.items(), train_set_count, train_set_count + val_set_count))
-    test_qrel: dict[str, list] = dict(islice(qrel_dict.items(), train_set_count + val_set_count, None))
+
+    train_qrel: dict[str, dict[str, int]] = dict(islice(qrel_dict.items(), train_set_count))
+    validation_qrel: dict[str, dict[str, int]] = dict(islice(qrel_dict.items(), train_set_count, train_set_count + val_set_count))
+    test_qrel: dict[str, dict[str, int]] = dict(islice(qrel_dict.items(), train_set_count + val_set_count, None))
+
     return train_qrel, validation_qrel, test_qrel
 
 # Given Topics File Path, Return Query Dictionary [ QID -> (Title, Body, Tags) ]
 def load_topic_file(topic_filepath: str) -> dict[str, list[str]]:
-    queries_json: list[dict[str, str]] = json.load(open(topic_filepath))
+    queries_json: list[dict[str, str]] = json.load(open(topic_filepath, 'r', encoding='utf-8'))
     queries_dict: dict[str, list[str]] = {}
     for query in tqdm(queries_json, desc='Loading Topics/Queries...', colour='blue'):
         title = preprocess_text(query['Title'])
@@ -88,13 +106,12 @@ def read_qrel_file(qrel_filepath: str) -> dict[str, dict[str, int]]:
 
 # Given Answer/Document File Path, Return Document Dictionary [ DocID -> Text ]
 def read_collection(answer_filepath: str) -> dict[str, str]:
-    doc_list: list[str, dict[str, str]] = json.load(open(answer_filepath))
+    doc_list: list[str, dict[str, str]] = json.load(open(answer_filepath, 'r', encoding='utf-8'))
     doc_dict: dict[str, str] = {}
     for doc in tqdm(doc_list, desc='Reading Doc Collection...', colour='yellow'):
         doc_dict[doc['Id']] = preprocess_text(doc['Text'])
     return doc_dict
 
-# ! Not Removing Stop Words ATM
 def preprocess_text(text_string: str) -> str:
     global stopwords
     res_str: str = bs(text_string, "html.parser").get_text(separator=' ')
@@ -109,15 +126,6 @@ def generate_query_tokens(queries_dict: dict[str, list[str]]) -> dict[str, str]:
     for query_id in tqdm(queries_dict, desc='Generating Query Tokens...', colour='green'):
         query_tokens[query_id] = "[TITLE]" + queries_dict[query_id][0] + "[BODY]" + queries_dict[query_id][1]
     return query_tokens
-
-def retrieval_to_file(retrieval_results: dict[str, dict[str, float]], model: str, num: int):
-    with open(f'result_{model}_{num}.tsv', 'w') as csv:
-        csv_writer = csv.writer(csv, delimiter='\t')
-        for qid, doc_id_scores  in retrieval_results.items():
-            for doc_id, score in doc_id_scores.items():
-                csv_writer.writerow([qid, 'q0', doc_id, score])
-        csv.close()
-    pass
 
 if __name__ == '__main__':
     __main__()
